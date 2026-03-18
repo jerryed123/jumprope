@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>줄넘기 AI 카운터 v2</title>
+<title>줄넘기 AI 카운터 v3</title>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.15.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Barlow+Condensed:wght@300;500;700;900&display=swap" rel="stylesheet">
@@ -189,6 +189,15 @@ body {
   padding: 14px 4px;
   text-align: center; width: 100%;
 }
+/* AWAY STATE */
+.person-card.away { opacity: 0.4; filter: saturate(0.25); }
+.away-badge {
+  position: absolute; bottom: 8px; right: 8px;
+  font-size: 8px; letter-spacing: .12em; font-weight: 700; text-transform: uppercase;
+  color: var(--muted2); border: 1px solid var(--border);
+  padding: 2px 5px; border-radius: 3px; display: none;
+}
+.person-card.away .away-badge { display: block; }
 
 /* EVENT LOG */
 .log-section {
@@ -257,7 +266,7 @@ input[type=range]::-webkit-slider-thumb {
 <div class="hdr">
   <div>
     <div class="hdr-title">줄넘기 AI</div>
-    <div class="hdr-sub">MULTI PERSON · FAIL DETECT</div>
+    <div class="hdr-sub">MULTI PERSON · FAIL DETECT · COLOR RE-ID</div>
   </div>
   <div class="hdr-btns">
     <button class="icon-btn" id="flip-btn">📷 전환</button>
@@ -353,7 +362,10 @@ let cooldownMs      = 380;
 let failThreshold   = 0.45;   // amplitude drop ratio for fail
 const RHYTHM_BREAK_RATIO = 1.85;
 const HISTORY_MAX   = 50;
-const STALE_MS      = 2200;   // remove person after 2.2s no detection
+const STALE_MS      = 2200;   // mark as "away" after 2.2s
+const GHOST_MS      = 60000;  // fully remove after 60s away
+const COLOR_BINS    = 16;     // hue histogram bins for color signature
+const COLOR_MATCH   = 0.62;   // cosine similarity threshold for re-id
 const LOG_MAX       = 5;
 
 // ═══════════════════════════════════════════════════════════
@@ -385,6 +397,8 @@ class PersonState {
     this.successCount   = 0;
     this.failCount      = 0;
     this.jumpTimestamps = [];     // for RPM
+    this.isAway         = false;
+    this.colorSig       = null;   // hue histogram sampled from torso region
     // Angle compensation: rolling shoulder/torso ratio
     this.angleRatio = 1.0;
   }
@@ -521,6 +535,68 @@ function getHipY(kp) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  COLOR RE-IDENTIFICATION
+// ═══════════════════════════════════════════════════════════
+
+// Sample torso region (shoulders → hips) from the video frame
+// Returns a normalized hue histogram (length = COLOR_BINS)
+function sampleTorsoColor(kp, video) {
+  const ls = kp[5], rs = kp[6], lh = kp[11], rh = kp[12];
+  if (!ls || !rs || !lh || !rh) return null;
+  if ([ls,rs,lh,rh].some(k => k.score < 0.22)) return null;
+
+  const sx = Math.min(ls.x, rs.x, lh.x, rh.x);
+  const ex = Math.max(ls.x, rs.x, lh.x, rh.x);
+  const sy = Math.min(ls.y, rs.y);
+  const ey = Math.max(lh.y, rh.y);
+  const w  = Math.max(ex - sx, 1);
+  const h  = Math.max(ey - sy, 1);
+  if (w < 8 || h < 8) return null;
+
+  // Draw just that region into a small offscreen canvas for pixel sampling
+  const oc  = document.createElement('canvas');
+  oc.width  = Math.min(w, 40);
+  oc.height = Math.min(h, 60);
+  const octx = oc.getContext('2d');
+  octx.drawImage(video, sx, sy, w, h, 0, 0, oc.width, oc.height);
+
+  const data = octx.getImageData(0, 0, oc.width, oc.height).data;
+  const hist = new Float32Array(COLOR_BINS);
+  let count  = 0;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i] / 255, g = data[i+1] / 255, b = data[i+2] / 255;
+    const max = Math.max(r,g,b), min = Math.min(r,g,b);
+    const s = max === 0 ? 0 : (max - min) / max;
+    if (s < 0.12 || max < 0.12) continue; // skip near-grey / near-black
+
+    let hue = 0;
+    if (max === r) hue = ((g - b) / (max - min) + 6) % 6;
+    else if (max === g) hue = (b - r) / (max - min) + 2;
+    else hue = (r - g) / (max - min) + 4;
+    hue = hue / 6; // 0–1
+
+    const bin = Math.min(Math.floor(hue * COLOR_BINS), COLOR_BINS - 1);
+    hist[bin] += s * max; // weight by saturation×brightness
+    count++;
+  }
+  if (count < 20) return null;
+
+  // L2 normalize
+  let norm = 0;
+  for (let i = 0; i < COLOR_BINS; i++) norm += hist[i] * hist[i];
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < COLOR_BINS; i++) hist[i] /= norm;
+  return hist;
+}
+
+function cosineSim(a, b) {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot; // already L2-normalized, so this is cosine similarity
+}
+
+// ═══════════════════════════════════════════════════════════
 //  CAMERA
 // ═══════════════════════════════════════════════════════════
 async function startCamera() {
@@ -615,12 +691,57 @@ async function loop() {
         const id = pose.id !== undefined ? pose.id : 0;
         seenIds.add(id);
 
-        if (!persons.has(id)) persons.set(id, new PersonState(id));
+        if (!persons.has(id)) {
+          // ── Color-based re-identification ──
+          const kpTmp  = pose.keypoints;
+          const newSig = sampleTorsoColor(kpTmp, video);
+          let reIdDone = false;
+
+          if (newSig) {
+            let bestSim = COLOR_MATCH, bestOldId = null;
+            for (const [lid, lp] of persons) {
+              if (!lp.isAway || !lp.colorSig) continue;
+              const sim = cosineSim(newSig, lp.colorSig);
+              if (sim > bestSim) { bestSim = sim; bestOldId = lid; }
+            }
+            if (bestOldId !== null) {
+              const restored = persons.get(bestOldId);
+              persons.delete(bestOldId);
+              const oldCard = document.getElementById('card-' + bestOldId);
+              if (oldCard) oldCard.remove();
+              restored.isAway   = false;
+              restored.colorSig = newSig; // refresh sig
+              restored.id       = id;
+              persons.set(id, restored);
+              reIdDone = true;
+            }
+          }
+          if (!reIdDone) persons.set(id, new PersonState(id));
+        }
         const p = persons.get(id);
         p.lastSeenMs = now;
+        p.isAway     = false;
 
         const kp = pose.keypoints;
         p.updateAngle(kp);
+
+        // Continuously refresh color signature while visible
+        const sig = sampleTorsoColor(kp, video);
+        if (sig) {
+          p.colorSig = p.colorSig
+            ? (() => { // EMA blend: 90% old + 10% new
+                const blended = new Float32Array(COLOR_BINS);
+                let norm = 0;
+                for (let i = 0; i < COLOR_BINS; i++) {
+                  blended[i] = p.colorSig[i] * 0.9 + sig[i] * 0.1;
+                  norm += blended[i] * blended[i];
+                }
+                norm = Math.sqrt(norm) || 1;
+                for (let i = 0; i < COLOR_BINS; i++) blended[i] /= norm;
+                return blended;
+              })()
+            : sig;
+        }
 
         const hipY = getHipY(kp);
         if (hipY !== null) {
@@ -636,12 +757,19 @@ async function loop() {
       }
 
       // Purge stale persons
+      // Mark away / fully purge
       for (const [id, p] of persons) {
-        if (now - p.lastSeenMs > STALE_MS) persons.delete(id);
+        const elapsed = now - p.lastSeenMs;
+        if (elapsed > GHOST_MS) {
+          persons.delete(id);
+        } else if (elapsed > STALE_MS) {
+          p.isAway = true;
+        }
       }
 
-      document.getElementById('pcnt').textContent = persons.size;
-      setStatus(persons.size > 0 ? '인식중' : '사람 찾는중…', persons.size > 0 ? 'live' : 'warn');
+      const activeCnt = [...persons.values()].filter(p => !p.isAway).length;
+      document.getElementById('pcnt').textContent = activeCnt;
+      setStatus(activeCnt > 0 ? '인식중' : '사람 찾는중…', activeCnt > 0 ? 'live' : 'warn');
       renderCards(now);
 
     } catch(e) { /* frame skip */ }
@@ -737,7 +865,7 @@ function renderCards(now) {
       const card = buildCard(p);
       grid.appendChild(card);
     }
-    // Update RPM
+    // Update RPM & away styling
     const card = document.getElementById('card-' + id);
     if (card) {
       const rpm = p.rpm(now);
@@ -745,6 +873,7 @@ function renderCards(now) {
       card.querySelector('.count-success').textContent = p.successCount;
       card.querySelector('.count-fail').textContent    = p.failCount;
       card.style.setProperty('--person-color', p.color);
+      card.classList.toggle('away', p.isAway);
     }
   }
 
@@ -775,6 +904,7 @@ function buildCard(p) {
     </div>
     <div class="card-rpm">속도 <span class="rpm-val">—</span></div>
     <div class="card-event-badge"></div>
+    <div class="away-badge">자리비움</div>
   `;
   return card;
 }
